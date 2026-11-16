@@ -699,16 +699,22 @@ export class MatchmakingManager {
     if (!client || !client.isReady()) return { matchesCreated: 0 };
 
     return await lockManager.withLock('lock:matchmaking:cycle', async () => {
+      const cycleStartedAt = performance.now();
+      const queueStartedAt = performance.now();
       const tickets = await this.getQueueTickets();
+      const queueLoadMs = Math.round(performance.now() - queueStartedAt);
       if (tickets.length < 2) return { matchesCreated: 0 };
 
       console.log(`[Matchmaking Cycle] Evaluating ${tickets.length} queue tickets.`);
 
       let matchesCreated = 0;
+      const preloadStartedAt = performance.now();
       const [blockLists, guildSettings] = await Promise.all([
         matchmakingEngine.preloadBlockLists(tickets),
         matchmakingEngine.preloadGuildSettings(tickets),
       ]);
+      const preloadMs = Math.round(performance.now() - preloadStartedAt);
+      const matchingStartedAt = performance.now();
       // Randomize the queue once. Since the remaining candidates retain a
       // uniformly random order, the first compatible candidate is a fair
       // random choice without a full reservoir-sampling scan.
@@ -762,6 +768,9 @@ export class MatchmakingManager {
         }
       }
 
+      const totalMs = Math.round(performance.now() - cycleStartedAt);
+      const matchingAndDeliveryMs = Math.round(performance.now() - matchingStartedAt);
+      console.log(`[Matchmaking Cycle] Complete: ${matchesCreated} matches from ${tickets.length} tickets | queue=${queueLoadMs}ms preload=${preloadMs}ms matching+delivery=${matchingAndDeliveryMs}ms total=${totalMs}ms`);
       return { matchesCreated };
     });
   }
