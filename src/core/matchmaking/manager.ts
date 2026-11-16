@@ -390,8 +390,13 @@ export class MatchmakingManager {
         // exact ticket values under both ticket locks during final reservation.
         for (let offset = 0; offset < ids.length; offset += lockBatchSize) {
           const batch = ids.slice(offset, offset + lockBatchSize);
-          const profiles = await db.getUsersByIds(batch, true);
-          const ticketValues = await stateStore.getMany(batch.map((userId) => `ticket:${userId}`));
+          // These reads are independent snapshots. Run them concurrently so
+          // queue loading pays the slower of the two network round trips rather
+          // than their sum; reservation still revalidates both tickets/profiles.
+          const [profiles, ticketValues] = await Promise.all([
+            db.getUsersByIds(batch, true),
+            stateStore.getMany(batch.map((userId) => `ticket:${userId}`)),
+          ]);
           const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
 
           for (const userId of batch) {
