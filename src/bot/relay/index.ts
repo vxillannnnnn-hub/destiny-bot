@@ -154,8 +154,12 @@ export class MessageRelayService {
         allowedMentions: { parse: [] },
       });
 
-      try {
-        await db.saveMessage({
+      // These writes are independent: run message persistence and room activity
+      // in parallel so their network latency does not accumulate per message.
+      // The sender's last_active_at update remains part of saveMessage.
+      const reactionTask = message.react(resolveBotReactionEmoji('✨')).catch(() => {});
+      const [persistResult, activityResult] = await Promise.allSettled([
+        db.saveMessage({
           roomId: room.id,
           senderUserId: authorUser.id,
           senderPseudonym,
@@ -164,22 +168,23 @@ export class MessageRelayService {
           isPinned: false,
           flaggedForModeration: !sanitized.isClean,
           moderationReason: sanitized.violations.join(', ') || undefined,
-        });
-      } catch (error) {
-        console.error('[Relay] Message was delivered but could not be persisted:', error);
+        }),
+        db.touchRoomActivity(room.id),
+      ]);
+
+      if (persistResult.status === 'rejected') {
+        console.error('[Relay] Message was delivered but could not be persisted:', persistResult.reason);
         await message.reply(formatCustomEmojiText('⚠️ Your message was delivered, but chat history could not be saved. Please try again later.')).catch(() => {});
+        await reactionTask;
         return true;
       }
 
-      try {
-        const touched = await db.touchRoomActivity(room.id);
-        if (!touched) console.warn(`[Relay] Room ${room.id} was no longer active after message persistence.`);
-      } catch (activityError) {
-        console.error('[Relay] Could not update room activity timestamp:', activityError);
+      if (activityResult.status === 'rejected') {
+        console.error('[Relay] Could not update room activity timestamp:', activityResult.reason);
+      } else if (!activityResult.value) {
+        console.warn(`[Relay] Room ${room.id} was no longer active after message persistence.`);
       }
-
-
-      await message.react(resolveBotReactionEmoji('✨')).catch(() => {});
+      await reactionTask;
       return true;
     } catch (err: any) {
       console.warn(`[Relay] DM delivery failed to user ${recipientDiscordId}:`, err?.message);
