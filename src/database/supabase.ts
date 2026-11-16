@@ -916,7 +916,7 @@ export class DatabaseService {
     if (missingIds.length === 0) return result;
 
     const requested = new Set(missingIds);
-    const mutable = new Map(missingIds.map((id) => [id, new Set<string>()]));
+    const mutable = new Map<string, Set<string>>(missingIds.map((id) => [id, new Set<string>()] as const));
 
     if (this.isMockMode || !this.client) {
       for (const block of this.mockBlocks) {
