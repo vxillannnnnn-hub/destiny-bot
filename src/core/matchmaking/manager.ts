@@ -244,9 +244,31 @@ export class MatchmakingManager {
   }
 
   /**
-   * Acquire multiple ticket locks in a stable global order. Queue scans batch
-   * lock acquisition and fresh profile reads together, avoiding stale profile
-   * snapshots without one database query per queued user.
+   * Remove a stale queue-set entry only after rechecking under the user's lock.
+   * This keeps the lock-free bulk scan from deleting a concurrent rejoin.
+   */
+  private async removeInvalidQueueSnapshot(userId: string, expectedRaw?: string): Promise<void> {
+    await this.withTicketLock(userId, async () => {
+      const key = `ticket:${userId}`;
+      const current = await stateStore.get(key);
+      if (expectedRaw === undefined) {
+        if (current !== null) return;
+        await stateStore.sRem('matchmaking:queue', userId);
+        this.inMemoryQueue.delete(userId);
+        return;
+      }
+      if (current !== expectedRaw) return;
+      const removed = await stateStore.delIfValue(key, expectedRaw);
+      if (removed) {
+        await stateStore.sRem('matchmaking:queue', userId);
+        this.inMemoryQueue.delete(userId);
+      }
+    });
+  }
+
+  /**
+   * Acquire multiple ticket locks in a stable global order when an operation
+   * truly needs a multi-user critical section (e.g. final room reservation).
    */
   async withTicketLocks<T>(userIds: string[], operation: () => Promise<T>): Promise<T> {
     const ordered = Array.from(new Set(userIds)).sort((a, b) => a.localeCompare(b));
@@ -361,23 +383,22 @@ export class MatchmakingManager {
 
         const activeTickets: MatchTicket[] = [];
         const activeIds = new Set<string>();
-        const lockBatchSize = 25;
+        const lockBatchSize = 100;
 
-        // Fresh DB profiles are read only after all ticket locks in their batch
-        // are acquired. This guarantees profile changes and bans cannot slip
-        // between the profile read and ticket reservation.
+        // Read a lightweight candidate snapshot without per-user distributed
+        // locks. Every selected pair is revalidated against fresh profiles and
+        // exact ticket values under both ticket locks during final reservation.
         for (let offset = 0; offset < ids.length; offset += lockBatchSize) {
           const batch = ids.slice(offset, offset + lockBatchSize);
-          await this.withTicketLocks(batch, async () => {
-            const profiles = await db.getUsersByIds(batch, true);
-            const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
+          const profiles = await db.getUsersByIds(batch, true);
+          const ticketValues = await stateStore.getMany(batch.map((userId) => `ticket:${userId}`));
+          const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
 
-            for (const userId of batch) {
+          for (const userId of batch) {
               const key = `ticket:${userId}`;
-              const raw = await stateStore.get(key);
+              const raw = ticketValues.get(key) ?? null;
               if (!raw) {
-                await stateStore.sRem('matchmaking:queue', userId);
-                this.inMemoryQueue.delete(userId);
+                await this.removeInvalidQueueSnapshot(userId);
                 continue;
               }
 
@@ -385,9 +406,7 @@ export class MatchmakingManager {
               try {
                 ticket = JSON.parse(raw) as MatchTicket;
               } catch {
-                const removed = await stateStore.delIfValue(key, raw);
-                if (removed) await stateStore.sRem('matchmaking:queue', userId);
-                this.inMemoryQueue.delete(userId);
+                await this.removeInvalidQueueSnapshot(userId, raw);
                 continue;
               }
 
@@ -423,11 +442,7 @@ export class MatchmakingManager {
                 ticket.userId !== userId ||
                 !profileEligible
               ) {
-                const removed = await stateStore.delIfValue(key, raw);
-                if (removed) {
-                  await stateStore.sRem('matchmaking:queue', userId);
-                  this.inMemoryQueue.delete(userId);
-                }
+                await this.removeInvalidQueueSnapshot(userId, raw);
                 continue;
               }
 
@@ -458,21 +473,17 @@ export class MatchmakingManager {
               };
 
               if (!isValidMatchTicket(refreshedTicket)) {
-                const removed = await stateStore.delIfValue(key, raw);
-                if (removed) {
-                  await stateStore.sRem('matchmaking:queue', userId);
-                  this.inMemoryQueue.delete(userId);
-                }
+                await this.removeInvalidQueueSnapshot(userId, raw);
                 continue;
               }
 
-              const serialized = JSON.stringify(refreshedTicket);
-              if (serialized !== raw) await stateStore.set(key, serialized, remainingSeconds);
+              // Do not write the refreshed snapshot back without the ticket lock:
+              // a concurrent rejoin may have replaced this key after getMany().
+              // The final reservation refreshes the profile again under both locks.
               this.inMemoryQueue.set(userId, refreshedTicket);
               activeIds.add(userId);
               activeTickets.push(refreshedTicket);
             }
-          });
         }
 
         for (const userId of this.inMemoryQueue.keys()) {
@@ -686,16 +697,25 @@ export class MatchmakingManager {
     if (!client || !client.isReady()) return { matchesCreated: 0 };
 
     return await lockManager.withLock('lock:matchmaking:cycle', async () => {
+      const cycleStartedAt = performance.now();
+      const queueStartedAt = performance.now();
       const tickets = await this.getQueueTickets();
+      const queueLoadMs = Math.round(performance.now() - queueStartedAt);
       if (tickets.length < 2) return { matchesCreated: 0 };
 
       console.log(`[Matchmaking Cycle] Evaluating ${tickets.length} queue tickets.`);
 
       let matchesCreated = 0;
-      const blockLists = await matchmakingEngine.preloadBlockLists(tickets);
-      // Randomize who gets considered first in this cycle as well as each
-      // user's eligible partner selection; no one is permanently favored by
-      // Database set iteration order or FIFO queue position.
+      const preloadStartedAt = performance.now();
+      const [blockLists, guildSettings] = await Promise.all([
+        matchmakingEngine.preloadBlockLists(tickets),
+        matchmakingEngine.preloadGuildSettings(tickets),
+      ]);
+      const preloadMs = Math.round(performance.now() - preloadStartedAt);
+      const matchingStartedAt = performance.now();
+      // Randomize the queue once. Since the remaining candidates retain a
+      // uniformly random order, the first compatible candidate is a fair
+      // random choice without a full reservoir-sampling scan.
       const unmatched = [...tickets];
       for (let i = unmatched.length - 1; i > 0; i -= 1) {
         const j = Math.floor(Math.random() * (i + 1));
@@ -703,13 +723,16 @@ export class MatchmakingManager {
       }
 
       while (unmatched.length > 1) {
-        const ticketA = unmatched.shift()!;
-        const match = await matchmakingEngine.findRandomMatch(ticketA, unmatched, blockLists);
+        const ticketA = unmatched.pop()!;
+        const match = await matchmakingEngine.findRandomMatch(
+          ticketA, unmatched, blockLists, guildSettings, true
+        );
         if (match) {
-          const ticketB = match.partner;
-          const partnerIndex = unmatched.findIndex((ticket) => ticket.userId === ticketB.userId);
-          if (partnerIndex < 0) continue;
-          unmatched.splice(partnerIndex, 1);
+          const ticketB = unmatched[match.index];
+          if (!ticketB || ticketB.userId !== match.partner.userId) continue;
+          // O(1) unordered removal; the queue was randomized before selection.
+          unmatched[match.index] = unmatched[unmatched.length - 1];
+          unmatched.pop();
 
           console.log('[Matchmaking Cycle] Compatible pair found; reserving queue tickets.');
           try {
@@ -717,7 +740,7 @@ export class MatchmakingManager {
             if (!reservedRoom) {
               // One user left, rejoined, or had their ticket refreshed after the
               // queue snapshot. Keep the other candidate available for matching.
-              unmatched.splice(partnerIndex, 0, ticketB);
+              unmatched.push(ticketB);
               continue;
             }
             // The DB room is committed under both ticket locks. Release them
@@ -743,6 +766,9 @@ export class MatchmakingManager {
         }
       }
 
+      const totalMs = Math.round(performance.now() - cycleStartedAt);
+      const matchingAndDeliveryMs = Math.round(performance.now() - matchingStartedAt);
+      console.log(`[Matchmaking Cycle] Complete: ${matchesCreated} matches from ${tickets.length} tickets | queue=${queueLoadMs}ms preload=${preloadMs}ms matching+delivery=${matchingAndDeliveryMs}ms total=${totalMs}ms`);
       return { matchesCreated };
     });
   }

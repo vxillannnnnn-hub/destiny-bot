@@ -74,6 +74,37 @@ export class SupabaseStateStore {
     return row.value;
   }
 
+  /**
+   * Fetch multiple runtime values in one database round trip.
+   * Expired values are returned as null; periodic runtime-state pruning removes
+   * their physical rows without serializing every queue scan behind N reads.
+   */
+  async getMany(keys: string[]): Promise<Map<string, string | null>> {
+    const uniqueKeys = Array.from(new Set(keys.filter((key) => typeof key === 'string' && key.length > 0)));
+    const result = new Map<string, string | null>(uniqueKeys.map((key) => [key, null] as const));
+    if (uniqueKeys.length === 0) return result;
+
+    const client = this.requireClient('batch get');
+    if (!client) {
+      const now = Date.now();
+      for (const key of uniqueKeys) {
+        const item = this.values.get(key);
+        if (item && (item.expiresAt === null || item.expiresAt > now)) result.set(key, item.value);
+        else if (item) this.values.delete(key);
+      }
+      return result;
+    }
+
+    const rows = await this.call('batch state read', client.from('runtime_kv')
+      .select('key,value,expires_at')
+      .in('key', uniqueKeys));
+    const now = Date.now();
+    for (const row of (rows || []) as Array<{ key: string; value: string; expires_at: string | null }>) {
+      if (!row.expires_at || Date.parse(row.expires_at) > now) result.set(row.key, row.value);
+    }
+    return result;
+  }
+
   async getBuffer(key: string): Promise<Buffer | null> {
     const value = await this.get(key);
     return value === null ? null : Buffer.from(value, 'base64');

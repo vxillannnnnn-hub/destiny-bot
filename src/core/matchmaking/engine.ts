@@ -182,16 +182,18 @@ export class MatchmakingEngine {
    */
   async preloadBlockLists(tickets: MatchTicket[]): Promise<Map<string, ReadonlySet<string>>> {
     const userIds = Array.from(new Set(tickets.map((ticket) => ticket.userId).filter(Boolean)));
-    const result = new Map<string, ReadonlySet<string>>();
-    const batchSize = 25;
-    for (let offset = 0; offset < userIds.length; offset += batchSize) {
-      const batch = userIds.slice(offset, offset + batchSize);
-      const entries = await Promise.all(batch.map(async (userId) =>
-        [userId, await db.getBlockedUserIds(userId)] as const
-      ));
-      for (const [userId, blockedIds] of entries) result.set(userId, blockedIds);
-    }
-    return result;
+    return db.getBlockedUserIdsForUsers(userIds);
+  }
+
+  /** Load each participating guild's cross-server policy once per cycle. */
+  async preloadGuildSettings(tickets: MatchTicket[]): Promise<Map<string, Awaited<ReturnType<typeof db.getGuildSettings>>>> {
+    const guildIds = Array.from(new Set(tickets
+      .map((ticket) => ticket.guildId)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0)));
+    const entries = await Promise.all(guildIds.map(async (guildId) =>
+      [guildId, await db.getGuildSettings(guildId)] as const
+    ));
+    return new Map(entries);
   }
 
   /**
@@ -202,29 +204,32 @@ export class MatchmakingEngine {
   async findRandomMatch(
     ticket: MatchTicket,
     candidates: MatchTicket[],
-    preloadedBlockLists?: ReadonlyMap<string, ReadonlySet<string>>
-  ): Promise<{ partner: MatchTicket; matchResult: MatchCandidateResult } | null> {
+    preloadedBlockLists?: ReadonlyMap<string, ReadonlySet<string>>,
+    preloadedGuildSettings?: ReadonlyMap<string, Awaited<ReturnType<typeof db.getGuildSettings>>>,
+    candidatesAreRandomized = false
+  ): Promise<{ partner: MatchTicket; matchResult: MatchCandidateResult; index: number } | null> {
     const blockLists = preloadedBlockLists ?? await this.preloadBlockLists([ticket, ...candidates]);
-    // A guild may opt out of cross-server discovery. Load each involved guild
-    // once per selection cycle rather than issuing a query for every candidate.
-    const otherGuildIds = ticket.guildId
-      ? Array.from(new Set(candidates
-          .map((candidate) => candidate.guildId)
-          .filter((id): id is string => typeof id === 'string' && id.length > 0 && id !== ticket.guildId)))
-      : [];
-    // Only cross-server candidates need configuration. A ticket without guild
-    // attribution cannot cross a guild boundary, so it never triggers reads.
-    const guildIds = otherGuildIds.length > 0 ? [ticket.guildId!, ...otherGuildIds] : [];
-    const guildSettings = new Map<string, Awaited<ReturnType<typeof db.getGuildSettings>>>();
-    const settings = await Promise.all(guildIds.map(async (guildId) =>
-      [guildId, await db.getGuildSettings(guildId)] as const
-    ));
-    for (const [guildId, value] of settings) guildSettings.set(guildId, value);
+    let guildSettings: ReadonlyMap<string, Awaited<ReturnType<typeof db.getGuildSettings>>> = preloadedGuildSettings ?? new Map();
 
-    let selected: { partner: MatchTicket; matchResult: MatchCandidateResult } | null = null;
+    if (!preloadedGuildSettings) {
+      // Compatibility path for direct callers outside a matchmaking cycle.
+      const otherGuildIds = ticket.guildId
+        ? Array.from(new Set(candidates
+            .map((candidate) => candidate.guildId)
+            .filter((id): id is string => typeof id === 'string' && id.length > 0 && id !== ticket.guildId)))
+        : [];
+      const guildIds = otherGuildIds.length > 0 ? [ticket.guildId!, ...otherGuildIds] : [];
+      const settings = await Promise.all(guildIds.map(async (guildId) =>
+        [guildId, await db.getGuildSettings(guildId)] as const
+      ));
+      guildSettings = new Map(settings);
+    }
+
+    let selected: { partner: MatchTicket; matchResult: MatchCandidateResult; index: number } | null = null;
     let eligibleCount = 0;
 
-    for (const candidate of candidates) {
+    for (let index = 0; index < candidates.length; index += 1) {
+      const candidate = candidates[index];
       if (candidate.userId === ticket.userId || candidate.discordUserId === ticket.discordUserId) continue;
       if (ticket.guildId !== candidate.guildId) {
         // A guild-scoped ticket must never be paired with an unattributed
@@ -238,9 +243,16 @@ export class MatchmakingEngine {
       const result = this.evaluateWithBlockLists(ticket, candidate, blockLists);
       if (!result.isEligible) continue;
 
+      if (candidatesAreRandomized) {
+        // The manager shuffles the remaining queue once per cycle. The first
+        // eligible candidate in that random order is uniformly selected and
+        // avoids evaluating every compatible pair just to reservoir-sample.
+        return { partner: candidate, matchResult: result, index };
+      }
+
       eligibleCount += 1;
       if (Math.random() < 1 / eligibleCount) {
-        selected = { partner: candidate, matchResult: result };
+        selected = { partner: candidate, matchResult: result, index };
       }
     }
     return selected;
