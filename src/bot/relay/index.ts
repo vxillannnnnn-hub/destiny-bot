@@ -12,19 +12,21 @@ export class MessageRelayService {
   /**
    * Process incoming Discord message from DM or designated room channel
    */
-  async handleIncomingMessage(client: Client, message: Message): Promise<boolean> {
+  async handleIncomingMessage(client: Client, message: Message, knownUser?: UserProfile, knownRoom?: RoomSession): Promise<boolean> {
     if (message.author.bot) return false;
     if (message.guild !== null) return false;
 
     const authorDiscordId = message.author.id;
-    const authorUser = await db.getUserByDiscordId(authorDiscordId, true);
+    // The DM handler already loaded and validated this user's active room. Reuse
+    // that snapshot instead of repeating the same Supabase reads for every message.
+    const authorUser = knownUser || await db.getUserByDiscordId(authorDiscordId, true);
     if (!authorUser) return false;
 
     const activeRoomId = authorUser.activeRoomId ||
       (await stateStore.get(`user:active_room:${authorUser.id}`)) || undefined;
     if (!activeRoomId) return false;
 
-    const room = await db.getRoomById(activeRoomId);
+    const room = knownRoom?.id === activeRoomId ? knownRoom : await db.getRoomById(activeRoomId);
     if (!room || room.status !== 'active') return false;
     if (authorUser.activeRoomId !== room.id) {
       console.warn('[Relay] Refusing message because the sender no longer points to this active room.');
@@ -36,8 +38,12 @@ export class MessageRelayService {
     }
 
     return await lockManager.withLock(`lock:room:${room.id}`, async () => {
-      const latestUser = await db.getUserById(authorUser.id, true);
-      const latestRoom = await db.getRoomById(room.id);
+      const [latestUser, latestRoom] = await Promise.all([
+        db.getUserById(authorUser.id, true),
+        // Relay only needs participant IDs/status; avoid getRoomById's two
+        // additional participant-profile lookups on every incoming message.
+        db.getRoomById(room.id, false),
+      ]);
       if (
         !latestUser ||
         !latestRoom ||
@@ -55,7 +61,7 @@ export class MessageRelayService {
         return false;
       }
 
-      return this.deliverToRoom(client, message, latestUser, latestRoom);
+      return this.deliverToRoom(client, message, latestUser, latestRoom, partner.discordUserId);
     });
   }
 
@@ -63,7 +69,8 @@ export class MessageRelayService {
     client: Client,
     message: Message,
     authorUser: UserProfile,
-    room: RoomSession
+    room: RoomSession,
+    validatedRecipientDiscordId?: string
   ): Promise<boolean> {
     const rateLimit = await stateStore.checkRateLimit(`relay:${authorUser.id}`, 5, 3);
     if (!rateLimit.allowed) {
@@ -74,7 +81,7 @@ export class MessageRelayService {
     const isUser1 = room.user1Id === authorUser.id;
     const senderPseudonym = isUser1 ? room.user1Pseudonym : room.user2Pseudonym;
     const senderAvatar = isUser1 ? room.user1Avatar : room.user2Avatar;
-    let recipientDiscordId = isUser1 ? room.user2DiscordId : room.user1DiscordId;
+    let recipientDiscordId = validatedRecipientDiscordId || (isUser1 ? room.user2DiscordId : room.user1DiscordId);
 
     if (!recipientDiscordId) {
       const recipientUser = await db.getUserById(isUser1 ? room.user2Id : room.user1Id);
@@ -147,8 +154,12 @@ export class MessageRelayService {
         allowedMentions: { parse: [] },
       });
 
-      try {
-        await db.saveMessage({
+      // These writes are independent: run message persistence and room activity
+      // in parallel so their network latency does not accumulate per message.
+      // The sender's last_active_at update remains part of saveMessage.
+      const reactionTask = message.react(resolveBotReactionEmoji('✨')).catch(() => {});
+      const [persistResult, activityResult] = await Promise.allSettled([
+        db.saveMessage({
           roomId: room.id,
           senderUserId: authorUser.id,
           senderPseudonym,
@@ -157,22 +168,23 @@ export class MessageRelayService {
           isPinned: false,
           flaggedForModeration: !sanitized.isClean,
           moderationReason: sanitized.violations.join(', ') || undefined,
-        });
-      } catch (error) {
-        console.error('[Relay] Message was delivered but could not be persisted:', error);
+        }),
+        db.touchRoomActivity(room.id),
+      ]);
+
+      if (persistResult.status === 'rejected') {
+        console.error('[Relay] Message was delivered but could not be persisted:', persistResult.reason);
         await message.reply(formatCustomEmojiText('⚠️ Your message was delivered, but chat history could not be saved. Please try again later.')).catch(() => {});
+        await reactionTask;
         return true;
       }
 
-      try {
-        const touched = await db.touchRoomActivity(room.id);
-        if (!touched) console.warn(`[Relay] Room ${room.id} was no longer active after message persistence.`);
-      } catch (activityError) {
-        console.error('[Relay] Could not update room activity timestamp:', activityError);
+      if (activityResult.status === 'rejected') {
+        console.error('[Relay] Could not update room activity timestamp:', activityResult.reason);
+      } else if (!activityResult.value) {
+        console.warn(`[Relay] Room ${room.id} was no longer active after message persistence.`);
       }
-
-
-      await message.react(resolveBotReactionEmoji('✨')).catch(() => {});
+      await reactionTask;
       return true;
     } catch (err: any) {
       console.warn(`[Relay] DM delivery failed to user ${recipientDiscordId}:`, err?.message);
