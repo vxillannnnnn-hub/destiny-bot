@@ -180,11 +180,11 @@ export class DatabaseService {
       batches.push(uniqueIds.slice(offset, offset + batchSize));
     }
 
-    // Keep PostgREST requests concurrent but bounded. Sequential batches add
-    // one full network round trip per 100 users; unbounded fan-out can overload
-    // the database when the queue grows into the thousands.
+    // A single queue snapshot can contain several hundred users. Bound the
+    // number of concurrent PostgREST requests to reduce wall-clock latency
+    // without opening an unbounded connection/request fan-out.
     for (let offset = 0; offset < batches.length; offset += maxConcurrentBatches) {
-      const batchResults = await Promise.all(batches.slice(offset, offset + maxConcurrentBatches).map(async (batch) => {
+      const results = await Promise.all(batches.slice(offset, offset + maxConcurrentBatches).map(async (batch) => {
         const { data, error } = await this.client!
           .from('users')
           .select('*')
@@ -193,7 +193,7 @@ export class DatabaseService {
         return data || [];
       }));
 
-      for (const rows of batchResults) {
+      for (const rows of results) {
         for (const row of rows) {
           const user = this.mapUser(row);
           users.push(user);
