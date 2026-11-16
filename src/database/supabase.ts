@@ -856,28 +856,35 @@ export class DatabaseService {
       return chatMsg;
     }
 
-    const { data, error } = await this.client
-      .from('messages')
-      .insert({
-        id: chatMsg.id,
-        room_id: chatMsg.roomId,
-        sender_user_id: chatMsg.senderUserId,
-        sender_pseudonym: chatMsg.senderPseudonym,
-        sanitized_content: chatMsg.sanitizedContent,
-        attachments_meta: chatMsg.attachmentsMeta,
-        is_pinned: chatMsg.isPinned,
-        flagged_for_moderation: chatMsg.flaggedForModeration,
-        moderation_reason: chatMsg.moderationReason,
-      })
-      .select()
-      .single();
+    // The message insert and last-active timestamp are independent writes.
+    // Run them concurrently instead of adding a second PostgREST round trip
+    // to every message's critical path.
+    const [insertResult, activityResult] = await Promise.all([
+      this.client
+        .from('messages')
+        .insert({
+          id: chatMsg.id,
+          room_id: chatMsg.roomId,
+          sender_user_id: chatMsg.senderUserId,
+          sender_pseudonym: chatMsg.senderPseudonym,
+          sanitized_content: chatMsg.sanitizedContent,
+          attachments_meta: chatMsg.attachmentsMeta,
+          is_pinned: chatMsg.isPinned,
+          flagged_for_moderation: chatMsg.flaggedForModeration,
+          moderation_reason: chatMsg.moderationReason,
+        })
+        .select()
+        .single(),
+      this.client
+        .from('users')
+        .update({ last_active_at: now })
+        .eq('id', chatMsg.senderUserId),
+    ]);
 
-    if (error || !data) throw new Error(`Failed to persist chat message: ${error?.message || 'no row returned'}`);
-    const { error: activityError } = await this.client
-      .from('users')
-      .update({ last_active_at: now })
-      .eq('id', chatMsg.senderUserId);
-    if (activityError) console.warn('[Database] Could not update last-active timestamp:', activityError.message);
+    if (insertResult.error || !insertResult.data) {
+      throw new Error(`Failed to persist chat message: ${insertResult.error?.message || 'no row returned'}`);
+    }
+    if (activityResult.error) console.warn('[Database] Could not update last-active timestamp:', activityResult.error.message);
     return chatMsg;
   }
 
