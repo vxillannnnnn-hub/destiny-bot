@@ -390,14 +390,11 @@ export class MatchmakingManager {
         // exact ticket values under both ticket locks during final reservation.
         for (let offset = 0; offset < ids.length; offset += lockBatchSize) {
           const batch = ids.slice(offset, offset + lockBatchSize);
-          // The scan is a candidate snapshot only. The final reservation
-          // re-acquires both users' locks and revalidates their ticket + profile,
-          // so holding 25 distributed locks across every scan batch is redundant.
           const profiles = await db.getUsersByIds(batch, true);
           const ticketValues = await stateStore.getMany(batch.map((userId) => `ticket:${userId}`));
-            const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
+          const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
 
-            for (const userId of batch) {
+          for (const userId of batch) {
               const key = `ticket:${userId}`;
               const raw = ticketValues.get(key) ?? null;
               if (!raw) {
@@ -480,8 +477,9 @@ export class MatchmakingManager {
                 continue;
               }
 
-              const serialized = JSON.stringify(refreshedTicket);
-              if (serialized !== raw) await stateStore.set(key, serialized, remainingSeconds);
+              // Do not write the refreshed snapshot back without the ticket lock:
+              // a concurrent rejoin may have replaced this key after getMany().
+              // The final reservation refreshes the profile again under both locks.
               this.inMemoryQueue.set(userId, refreshedTicket);
               activeIds.add(userId);
               activeTickets.push(refreshedTicket);
