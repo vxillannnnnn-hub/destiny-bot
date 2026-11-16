@@ -44,6 +44,11 @@ async function runMilestoneBenchmark(concurrency: number) {
   const ingestDurationMs = performance.now() - startIngest;
   const ingestRps = Math.round((concurrency / (ingestDurationMs / 1000)));
 
+  // Load block lists once per benchmark batch. Calling evaluateMatch()
+  // without this snapshot would issue a database lookup for every candidate
+  // pair and benchmark network overhead rather than the matching algorithm.
+  const blockLists = await engine.preloadBlockLists(tickets);
+
   // Benchmark pairing evaluation throughput
   const startPairing = performance.now();
   let pairsMatched = 0;
@@ -59,7 +64,7 @@ async function runMilestoneBenchmark(concurrency: number) {
       const tB = tickets[j];
       if (matchedSet.has(tB.userId)) continue;
 
-      const res = await engine.evaluateMatch(tA, tB);
+      const res = await engine.evaluateMatch(tA, tB, blockLists);
       if (res.isEligible && res.score >= 50) {
         matchedSet.add(tA.userId);
         matchedSet.add(tB.userId);
