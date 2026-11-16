@@ -898,35 +898,68 @@ export class DatabaseService {
   }
 
   // ---------------- BLOCKS & SAFETY ----------------
-  async getBlockedUserIds(userId: string): Promise<Set<string>> {
-    const cached = this.blockListCache.get(userId);
-    if (cached && cached.expires > Date.now()) return new Set(cached.ids);
+  /**
+   * Load bidirectional block relationships for an entire matchmaking snapshot.
+   * This replaces one HTTP request per user with one request per bounded ID batch.
+   */
+  async getBlockedUserIdsForUsers(userIds: string[]): Promise<Map<string, ReadonlySet<string>>> {
+    const uniqueIds = Array.from(new Set(userIds.filter((id): id is string => typeof id === 'string' && id.length > 0)));
+    const result = new Map<string, ReadonlySet<string>>();
+    const missingIds: string[] = [];
+    const now = Date.now();
 
-    const blockedIds = new Set<string>();
+    for (const userId of uniqueIds) {
+      const cached = this.blockListCache.get(userId);
+      if (cached && cached.expires > now) result.set(userId, new Set(cached.ids));
+      else missingIds.push(userId);
+    }
+    if (missingIds.length === 0) return result;
+
+    const requested = new Set(missingIds);
+    const mutable = new Map(missingIds.map((id) => [id, new Set<string>()]));
+
     if (this.isMockMode || !this.client) {
       for (const block of this.mockBlocks) {
-        if (block.blockerId === userId) blockedIds.add(block.blockedId);
-        if (block.blockedId === userId) blockedIds.add(block.blockerId);
+        if (requested.has(block.blockerId)) mutable.get(block.blockerId)!.add(block.blockedId);
+        if (requested.has(block.blockedId)) mutable.get(block.blockedId)!.add(block.blockerId);
       }
     } else {
-      const { data, error } = await this.client
-        .from('user_blocks')
-        .select('blocker_id, blocked_id')
-        .or(`blocker_id.eq.${userId},blocked_id.eq.${userId}`);
-      if (error) throw new Error(`Failed to load user block list: ${error.message}`);
-      for (const row of data || []) {
-        if (row.blocker_id === userId) blockedIds.add(row.blocked_id);
-        if (row.blocked_id === userId) blockedIds.add(row.blocker_id);
+      // Keep PostgREST URLs bounded while avoiding the old N-per-user query pattern.
+      const batchSize = 100;
+      for (let offset = 0; offset < missingIds.length; offset += batchSize) {
+        const batch = missingIds.slice(offset, offset + batchSize);
+        const filter = batch.join(',');
+        const { data, error } = await this.client
+          .from('user_blocks')
+          .select('blocker_id, blocked_id')
+          .or(`blocker_id.in.(${filter}),blocked_id.in.(${filter})`);
+        if (error) throw new Error(`Failed to load matchmaking block lists: ${error.message}`);
+
+        for (const row of data || []) {
+          const blockerId = String(row.blocker_id);
+          const blockedId = String(row.blocked_id);
+          if (mutable.has(blockerId)) mutable.get(blockerId)!.add(blockedId);
+          if (mutable.has(blockedId)) mutable.get(blockedId)!.add(blockerId);
+        }
       }
     }
 
     if (this.blockListCache.size > 5000) {
       for (const [key, entry] of this.blockListCache) {
-        if (entry.expires <= Date.now()) this.blockListCache.delete(key);
+        if (entry.expires <= now) this.blockListCache.delete(key);
       }
     }
-    this.blockListCache.set(userId, { ids: blockedIds, expires: Date.now() + 5_000 });
-    return new Set(blockedIds);
+    const expires = now + 5_000;
+    for (const [userId, ids] of mutable) {
+      this.blockListCache.set(userId, { ids, expires });
+      result.set(userId, new Set(ids));
+    }
+    return result;
+  }
+
+  async getBlockedUserIds(userId: string): Promise<Set<string>> {
+    const result = await this.getBlockedUserIdsForUsers([userId]);
+    return new Set(result.get(userId) || []);
   }
 
   async isBlocked(userAId: string, userBId: string): Promise<boolean> {
