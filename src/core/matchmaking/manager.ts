@@ -361,20 +361,23 @@ export class MatchmakingManager {
 
         const activeTickets: MatchTicket[] = [];
         const activeIds = new Set<string>();
-        const lockBatchSize = 25;
+        const lockBatchSize = 100;
 
         // Fresh DB profiles are read only after all ticket locks in their batch
         // are acquired. This guarantees profile changes and bans cannot slip
         // between the profile read and ticket reservation.
         for (let offset = 0; offset < ids.length; offset += lockBatchSize) {
           const batch = ids.slice(offset, offset + lockBatchSize);
-          await this.withTicketLocks(batch, async () => {
-            const profiles = await db.getUsersByIds(batch, true);
+          // The scan is a candidate snapshot only. The final reservation
+          // re-acquires both users' locks and revalidates their ticket + profile,
+          // so holding 25 distributed locks across every scan batch is redundant.
+          const profiles = await db.getUsersByIds(batch, true);
+          const ticketValues = await stateStore.getMany(batch.map((userId) => `ticket:${userId}`));
             const profilesById = new Map(profiles.map((profile) => [profile.id, profile]));
 
             for (const userId of batch) {
               const key = `ticket:${userId}`;
-              const raw = await stateStore.get(key);
+              const raw = ticketValues.get(key) ?? null;
               if (!raw) {
                 await stateStore.sRem('matchmaking:queue', userId);
                 this.inMemoryQueue.delete(userId);
@@ -472,7 +475,6 @@ export class MatchmakingManager {
               activeIds.add(userId);
               activeTickets.push(refreshedTicket);
             }
-          });
         }
 
         for (const userId of this.inMemoryQueue.keys()) {
@@ -692,10 +694,13 @@ export class MatchmakingManager {
       console.log(`[Matchmaking Cycle] Evaluating ${tickets.length} queue tickets.`);
 
       let matchesCreated = 0;
-      const blockLists = await matchmakingEngine.preloadBlockLists(tickets);
-      // Randomize who gets considered first in this cycle as well as each
-      // user's eligible partner selection; no one is permanently favored by
-      // Database set iteration order or FIFO queue position.
+      const [blockLists, guildSettings] = await Promise.all([
+        matchmakingEngine.preloadBlockLists(tickets),
+        matchmakingEngine.preloadGuildSettings(tickets),
+      ]);
+      // Randomize the queue once. Since the remaining candidates retain a
+      // uniformly random order, the first compatible candidate is a fair
+      // random choice without a full reservoir-sampling scan.
       const unmatched = [...tickets];
       for (let i = unmatched.length - 1; i > 0; i -= 1) {
         const j = Math.floor(Math.random() * (i + 1));
@@ -703,13 +708,16 @@ export class MatchmakingManager {
       }
 
       while (unmatched.length > 1) {
-        const ticketA = unmatched.shift()!;
-        const match = await matchmakingEngine.findRandomMatch(ticketA, unmatched, blockLists);
+        const ticketA = unmatched.pop()!;
+        const match = await matchmakingEngine.findRandomMatch(
+          ticketA, unmatched, blockLists, guildSettings, true
+        );
         if (match) {
-          const ticketB = match.partner;
-          const partnerIndex = unmatched.findIndex((ticket) => ticket.userId === ticketB.userId);
-          if (partnerIndex < 0) continue;
-          unmatched.splice(partnerIndex, 1);
+          const ticketB = unmatched[match.index];
+          if (!ticketB || ticketB.userId !== match.partner.userId) continue;
+          // O(1) unordered removal; the queue was randomized before selection.
+          unmatched[match.index] = unmatched[unmatched.length - 1];
+          unmatched.pop();
 
           console.log('[Matchmaking Cycle] Compatible pair found; reserving queue tickets.');
           try {
@@ -717,7 +725,7 @@ export class MatchmakingManager {
             if (!reservedRoom) {
               // One user left, rejoined, or had their ticket refreshed after the
               // queue snapshot. Keep the other candidate available for matching.
-              unmatched.splice(partnerIndex, 0, ticketB);
+              unmatched.push(ticketB);
               continue;
             }
             // The DB room is committed under both ticket locks. Release them
