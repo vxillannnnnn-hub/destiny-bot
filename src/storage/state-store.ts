@@ -81,7 +81,7 @@ export class SupabaseStateStore {
    */
   async getMany(keys: string[]): Promise<Map<string, string | null>> {
     const uniqueKeys = Array.from(new Set(keys.filter((key) => typeof key === 'string' && key.length > 0)));
-    const result = new Map<string, string | null>(uniqueKeys.map((key) => [key, null]));
+    const result = new Map<string, string | null>(uniqueKeys.map((key) => [key, null] as const));
     if (uniqueKeys.length === 0) return result;
 
     const client = this.requireClient('batch get');
