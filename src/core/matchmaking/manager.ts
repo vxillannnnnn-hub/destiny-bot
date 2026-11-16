@@ -383,7 +383,7 @@ export class MatchmakingManager {
 
         const activeTickets: MatchTicket[] = [];
         const activeIds = new Set<string>();
-        const lockBatchSize = 100;
+        const lockBatchSize = 400;
 
         // Read a lightweight candidate snapshot without per-user distributed
         // locks. Every selected pair is revalidated against fresh profiles and
