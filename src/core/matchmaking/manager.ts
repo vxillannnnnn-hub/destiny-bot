@@ -244,9 +244,31 @@ export class MatchmakingManager {
   }
 
   /**
-   * Acquire multiple ticket locks in a stable global order. Queue scans batch
-   * lock acquisition and fresh profile reads together, avoiding stale profile
-   * snapshots without one database query per queued user.
+   * Remove a stale queue-set entry only after rechecking under the user's lock.
+   * This keeps the lock-free bulk scan from deleting a concurrent rejoin.
+   */
+  private async removeInvalidQueueSnapshot(userId: string, expectedRaw?: string): Promise<void> {
+    await this.withTicketLock(userId, async () => {
+      const key = `ticket:${userId}`;
+      const current = await stateStore.get(key);
+      if (expectedRaw === undefined) {
+        if (current !== null) return;
+        await stateStore.sRem('matchmaking:queue', userId);
+        this.inMemoryQueue.delete(userId);
+        return;
+      }
+      if (current !== expectedRaw) return;
+      const removed = await stateStore.delIfValue(key, expectedRaw);
+      if (removed) {
+        await stateStore.sRem('matchmaking:queue', userId);
+        this.inMemoryQueue.delete(userId);
+      }
+    });
+  }
+
+  /**
+   * Acquire multiple ticket locks in a stable global order when an operation
+   * truly needs a multi-user critical section (e.g. final room reservation).
    */
   async withTicketLocks<T>(userIds: string[], operation: () => Promise<T>): Promise<T> {
     const ordered = Array.from(new Set(userIds)).sort((a, b) => a.localeCompare(b));
@@ -363,9 +385,9 @@ export class MatchmakingManager {
         const activeIds = new Set<string>();
         const lockBatchSize = 100;
 
-        // Fresh DB profiles are read only after all ticket locks in their batch
-        // are acquired. This guarantees profile changes and bans cannot slip
-        // between the profile read and ticket reservation.
+        // Read a lightweight candidate snapshot without per-user distributed
+        // locks. Every selected pair is revalidated against fresh profiles and
+        // exact ticket values under both ticket locks during final reservation.
         for (let offset = 0; offset < ids.length; offset += lockBatchSize) {
           const batch = ids.slice(offset, offset + lockBatchSize);
           // The scan is a candidate snapshot only. The final reservation
@@ -379,8 +401,7 @@ export class MatchmakingManager {
               const key = `ticket:${userId}`;
               const raw = ticketValues.get(key) ?? null;
               if (!raw) {
-                await stateStore.sRem('matchmaking:queue', userId);
-                this.inMemoryQueue.delete(userId);
+                await this.removeInvalidQueueSnapshot(userId);
                 continue;
               }
 
@@ -388,9 +409,7 @@ export class MatchmakingManager {
               try {
                 ticket = JSON.parse(raw) as MatchTicket;
               } catch {
-                const removed = await stateStore.delIfValue(key, raw);
-                if (removed) await stateStore.sRem('matchmaking:queue', userId);
-                this.inMemoryQueue.delete(userId);
+                await this.removeInvalidQueueSnapshot(userId, raw);
                 continue;
               }
 
@@ -426,11 +445,7 @@ export class MatchmakingManager {
                 ticket.userId !== userId ||
                 !profileEligible
               ) {
-                const removed = await stateStore.delIfValue(key, raw);
-                if (removed) {
-                  await stateStore.sRem('matchmaking:queue', userId);
-                  this.inMemoryQueue.delete(userId);
-                }
+                await this.removeInvalidQueueSnapshot(userId, raw);
                 continue;
               }
 
@@ -461,11 +476,7 @@ export class MatchmakingManager {
               };
 
               if (!isValidMatchTicket(refreshedTicket)) {
-                const removed = await stateStore.delIfValue(key, raw);
-                if (removed) {
-                  await stateStore.sRem('matchmaking:queue', userId);
-                  this.inMemoryQueue.delete(userId);
-                }
+                await this.removeInvalidQueueSnapshot(userId, raw);
                 continue;
               }
 
