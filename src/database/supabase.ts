@@ -926,21 +926,28 @@ export class DatabaseService {
     } else {
       // Keep PostgREST URLs bounded while avoiding the old N-per-user query pattern.
       const batchSize = 100;
+      const batches: string[][] = [];
       for (let offset = 0; offset < missingIds.length; offset += batchSize) {
-        const batch = missingIds.slice(offset, offset + batchSize);
-        const filter = batch.join(',');
-        const { data, error } = await this.client
-          .from('user_blocks')
-          .select('blocker_id, blocked_id')
-          .or(`blocker_id.in.(${filter}),blocked_id.in.(${filter})`);
-        if (error) throw new Error(`Failed to load matchmaking block lists: ${error.message}`);
+        batches.push(missingIds.slice(offset, offset + batchSize));
+      }
+      // Bound concurrency to keep large queues quick without flooding PostgREST.
+      const concurrency = 10;
+      for (let offset = 0; offset < batches.length; offset += concurrency) {
+        await Promise.all(batches.slice(offset, offset + concurrency).map(async (batch) => {
+          const filter = batch.join(',');
+          const { data, error } = await this.client!
+            .from('user_blocks')
+            .select('blocker_id, blocked_id')
+            .or(`blocker_id.in.(${filter}),blocked_id.in.(${filter})`);
+          if (error) throw new Error(`Failed to load matchmaking block lists: ${error.message}`);
 
-        for (const row of data || []) {
-          const blockerId = String(row.blocker_id);
-          const blockedId = String(row.blocked_id);
-          if (mutable.has(blockerId)) mutable.get(blockerId)!.add(blockedId);
-          if (mutable.has(blockedId)) mutable.get(blockedId)!.add(blockerId);
-        }
+          for (const row of data || []) {
+            const blockerId = String(row.blocker_id);
+            const blockedId = String(row.blocked_id);
+            if (mutable.has(blockerId)) mutable.get(blockerId)!.add(blockedId);
+            if (mutable.has(blockedId)) mutable.get(blockedId)!.add(blockerId);
+          }
+        }));
       }
     }
 
