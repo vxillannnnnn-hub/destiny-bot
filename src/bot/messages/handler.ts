@@ -263,7 +263,7 @@ export class MessageCommandHandler {
 
         // Subcase A4: Normal chat text -> immediately relay message to partner!
         const { messageRelayService } = await import('../relay/index.js');
-        return await messageRelayService.handleIncomingMessage(client, message);
+        return await messageRelayService.handleIncomingMessage(client, message, user, activeRoom);
       }
     }
 
