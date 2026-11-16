@@ -536,7 +536,7 @@ export class DatabaseService {
     return mapped;
   }
 
-  async getRoomById(id: string): Promise<RoomSession | null> {
+  async getRoomById(id: string, includeParticipants = true): Promise<RoomSession | null> {
     if (this.isMockMode || !this.client) {
       const room = this.mockRooms.get(id);
       return room ? { ...room } : null;
@@ -545,7 +545,7 @@ export class DatabaseService {
     if (error) throw new Error(`Failed to load room: ${error.message}`);
     if (!data) return null;
     const mapped = this.mapRoom(data);
-    if (!mapped.user1DiscordId || !mapped.user2DiscordId) {
+    if (includeParticipants && (!mapped.user1DiscordId || !mapped.user2DiscordId)) {
       const [u1, u2] = await Promise.all([
         this.getUserById(mapped.user1Id),
         this.getUserById(mapped.user2Id),
