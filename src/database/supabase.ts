@@ -174,19 +174,32 @@ export class DatabaseService {
 
     const users: UserProfile[] = [];
     const batchSize = 100;
+    const maxConcurrentBatches = 4;
+    const batches: string[][] = [];
     for (let offset = 0; offset < uniqueIds.length; offset += batchSize) {
-      const batch = uniqueIds.slice(offset, offset + batchSize);
-      const { data, error } = await this.client
-        .from('users')
-        .select('*')
-        .in('id', batch);
-      if (error) throw new Error(`Failed to load matchmaking profiles: ${error.message}`);
+      batches.push(uniqueIds.slice(offset, offset + batchSize));
+    }
 
-      for (const row of data || []) {
-        const user = this.mapUser(row);
-        users.push(user);
-        this.userCache.set(user.id, { user, expires: Date.now() + 60_000 });
-        this.discordUserCache.set(user.discordUserId, { user, expires: Date.now() + 60_000 });
+    // Keep PostgREST requests concurrent but bounded. Sequential batches add
+    // one full network round trip per 100 users; unbounded fan-out can overload
+    // the database when the queue grows into the thousands.
+    for (let offset = 0; offset < batches.length; offset += maxConcurrentBatches) {
+      const batchResults = await Promise.all(batches.slice(offset, offset + maxConcurrentBatches).map(async (batch) => {
+        const { data, error } = await this.client!
+          .from('users')
+          .select('*')
+          .in('id', batch);
+        if (error) throw new Error(`Failed to load matchmaking profiles: ${error.message}`);
+        return data || [];
+      }));
+
+      for (const rows of batchResults) {
+        for (const row of rows) {
+          const user = this.mapUser(row);
+          users.push(user);
+          this.userCache.set(user.id, { user, expires: Date.now() + 60_000 });
+          this.discordUserCache.set(user.discordUserId, { user, expires: Date.now() + 60_000 });
+        }
       }
     }
     return users;
